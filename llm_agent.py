@@ -1,50 +1,57 @@
 # llm_agent.py
 import os
-import json
 import logging
+from typing import Optional
 import requests
+import json
 
 logger = logging.getLogger("llm_agent")
 
-API_KEY = os.getenv("GEMINI_API_KEY")
-if not API_KEY:
-    logger.warning("GEMINI_API_KEY not set")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# THE ONE AND ONLY WORKING ENDPOINT
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
+API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
 
-def ask_llm_for_action(page_text: str, pre_text: str = None):
-    if not API_KEY:
-        logger.error("GEMINI_API_KEY missing")
+def ask_llm_for_action(page_text: str, pre_text: Optional[str] = None) -> Optional[dict]:
+    """
+    Call Gemini to interpret instructions and return JSON action.
+    """
+    if not GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY missing in env")
         return None
 
-    prompt = (
-        "You are a helper that converts instructions into a JSON object. "
-        "Return ONLY valid JSON. Keys: action, column, page, cutoff.\n\n"
-        f"{pre_text or ''}\n{page_text}\n\nJSON:"
-    )
+    prompt = f"""
+You are a helper that returns ONLY a JSON object describing the next action.
+Possible fields: action, column, page, cutoff.
+Instruction + page text:
+{pre_text or ""}
+{page_text}
+Respond with JSON only.
+"""
 
     payload = {
         "contents": [
-            {"parts": [{"text": prompt}]}
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
         ]
     }
 
     try:
         response = requests.post(
-            f"{GEMINI_URL}?key={API_KEY}",
+            f"{API_URL}?key={GEMINI_API_KEY}",
             json=payload,
             timeout=20
         )
         response.raise_for_status()
-
         data = response.json()
 
-        ai_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        model_reply = data["candidates"][0]["content"]["parts"][0]["text"]
 
-        return json.loads(ai_text)
+        parsed = json.loads(model_reply)
+        return parsed
 
     except Exception as e:
-        logger.exception(f"Gemini call failed: {e}")
+        logger.exception("Gemini LLM call failed: %s", e)
         return None
-
