@@ -1,50 +1,56 @@
 # llm_agent.py
 import os
 import logging
-from typing import Optional, Dict, Any
-from openai import OpenAI
+from typing import Optional
+import requests
 import json
 
 logger = logging.getLogger("llm_agent")
 
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_KEY)
+AI_PIPE_KEY = os.getenv("OPENAI_API_KEY")  # AI Pipe key is stored here
 
+API_URL = "https://api.aipipe.ai/v1/chat/completions"
 
-def ask_llm_for_action(page_text: str, pre_text: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def ask_llm_for_action(page_text: str, pre_text: Optional[str] = None) -> Optional[dict]:
     """
-    Calls the LLM using the new OpenAI API (>=1.0).
-    Returns a structured JSON as a Python dict.
+    Calls AI Pipe (NOT OpenAI) to interpret instructions into a JSON action.
     """
 
-    if not OPENAI_KEY:
-        logger.warning("OPENAI_API_KEY not set: cannot call LLM.")
+    if not AI_PIPE_KEY:
+        logger.warning("AI PIPE KEY not set.")
         return None
 
     prompt = (
-        "You are a helper that converts a human instruction into a structured JSON action.\n"
-        "Fields allowed: action, column, page, cutoff.\n"
-        "Respond ONLY with valid JSON.\n\n"
-        f"Instruction:\n{pre_text or ''}\n{page_text}\n\n"
-        "Output JSON:"
+        "You are a helper that converts a human instruction into a structured action.\n"
+        "Respond only with a JSON object.\n"
+        "Possible fields: action, column, page, cutoff.\n\n"
+        f"Instruction:\n{pre_text or ''}\n{page_text}\n\nOutput JSON:"
     )
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You respond ONLY with valid JSON."},
-                {"role": "user", "content": prompt},
+        headers = {
+            "Authorization": f"Bearer {AI_PIPE_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": "gpt-4o-mini",   # AI Pipe supports this
+            "messages": [
+                {"role": "user", "content": prompt}
             ],
-            max_tokens=300,
-            temperature=0,
-        )
+            "temperature": 0
+        }
 
-        text = response.choices[0].message.content.strip()
+        response = requests.post(API_URL, headers=headers, json=payload)
+        response.raise_for_status()
 
-        # Ensure JSON decode
-        return json.loads(text)
+        data = response.json()
+
+        # AI Pipe response structure mirrors OpenAI 1.x
+        content = data["choices"][0]["message"]["content"]
+
+        return json.loads(content)
 
     except Exception as e:
-        logger.exception("LLM call failed: %s", e)
+        logger.exception("AI Pipe call failed: %s", e)
         return None
