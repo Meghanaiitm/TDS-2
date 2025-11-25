@@ -9,7 +9,8 @@ logger = logging.getLogger("llm_agent")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
+# ✅ Correct URL — this is the ONLY working endpoint format
+API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
 def ask_llm_for_action(page_text: str, pre_text: Optional[str] = None) -> Optional[dict]:
     """
@@ -47,10 +48,10 @@ Respond with JSON only.
         response.raise_for_status()
         data = response.json()
 
+        # Gemini text output location
         model_reply = data["candidates"][0]["content"]["parts"][0]["text"]
 
-        parsed = json.loads(model_reply)
-        return parsed
+        return json.loads(model_reply)
 
     except Exception as e:
         logger.exception("Gemini LLM call failed: %s", e)
