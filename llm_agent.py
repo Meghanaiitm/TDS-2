@@ -1,43 +1,50 @@
 # llm_agent.py
 import os
 import logging
-from typing import Optional
-import openai
+from typing import Optional, Dict, Any
+from openai import OpenAI
+import json
 
 logger = logging.getLogger("llm_agent")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-if OPENAI_KEY:
-    openai.api_key = OPENAI_KEY
 
-def ask_llm_for_action(page_text: str, pre_text: Optional[str] = None) -> Optional[dict]:
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_KEY)
+
+
+def ask_llm_for_action(page_text: str, pre_text: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
-    Call LLM to interpret a complex instruction and return a JSON spec describing the action.
-    Returns dict like {'action':'sum', 'column':'value', 'page':2, 'cutoff':38636}
+    Calls the LLM using the new OpenAI API (>=1.0).
+    Returns a structured JSON as a Python dict.
     """
+
     if not OPENAI_KEY:
         logger.warning("OPENAI_API_KEY not set: cannot call LLM.")
         return None
 
     prompt = (
-        "You are a helper that converts a human instruction into a structured action.\n"
-        "Input page text (the quiz question + any instructions). Respond ONLY with a JSON object.\n"
-        "Possible fields: action (sum/count/max/min/mean/chart/pdf_read/download_return_file/return_text), "
-        "column (optional), page (optional), cutoff (optional).\n\n"
+        "You are a helper that converts a human instruction into a structured JSON action.\n"
+        "Fields allowed: action, column, page, cutoff.\n"
+        "Respond ONLY with valid JSON.\n\n"
         f"Instruction:\n{pre_text or ''}\n{page_text}\n\n"
         "Output JSON:"
     )
+
     try:
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",  # replace with available model
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.0,
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You respond ONLY with valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
             max_tokens=300,
+            temperature=0,
         )
-        txt = resp.choices[0].message['content'].strip()
-        # Expect JSON only
-        import json
-        parsed = json.loads(txt)
-        return parsed
+
+        text = response.choices[0].message.content.strip()
+
+        # Ensure JSON decode
+        return json.loads(text)
+
     except Exception as e:
         logger.exception("LLM call failed: %s", e)
         return None
