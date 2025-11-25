@@ -1,49 +1,53 @@
 # llm_agent.py
 import os
+import json
 import logging
-from typing import Optional
-from openai import OpenAI
+import requests
 
 logger = logging.getLogger("llm_agent")
 
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+API_KEY = os.getenv("GEMINI_API_KEY")
+if not API_KEY:
+    logger.warning("GEMINI_API_KEY is not set")
 
-# New OpenAI client (works for 2024+)
-client = OpenAI(api_key=OPENAI_KEY)
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
 
-
-def ask_llm_for_action(page_text: str, pre_text: Optional[str] = None) -> Optional[dict]:
+def ask_llm_for_action(page_text: str, pre_text: str = None):
     """
-    Converts a quiz instruction to a JSON action dict using OpenAI Chat Completions API.
+    Calls Gemini API and expects ONLY JSON output.
     """
-
-    if not OPENAI_KEY:
-        logger.warning("OPENAI_API_KEY not set")
+    if not API_KEY:
+        logger.error("No GEMINI_API_KEY set.")
         return None
 
     prompt = (
-        "You are a helper that converts a human instruction into a structured JSON action.\n"
-        "Respond ONLY with a JSON object.\n\n"
-        f"Page text:\n{page_text}\n\n"
-        f"Instruction:\n{pre_text or ''}\n\n"
-        "Output JSON:"
+        "You are a helper that converts instructions into a structured JSON action.\n"
+        "Return ONLY a JSON object.\n"
+        "Possible keys: action, column, page, cutoff.\n\n"
+        f"Instruction:\n{pre_text or ''}\n{page_text}\n\n"
+        "Output JSON only."
     )
 
+    payload = {
+        "contents": [
+            {"parts": [{"text": prompt}]}
+        ]
+    }
+
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
-            max_tokens=300
+        response = requests.post(
+            f"{GEMINI_URL}?key={API_KEY}",
+            json=payload,
+            timeout=15
         )
 
-        text = response.choices[0].message.content.strip()
+        response.raise_for_status()
+        data = response.json()
 
-        import json
-        return json.loads(text)
+        ai_text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+        return json.loads(ai_text)  # parse JSON output
 
     except Exception as e:
-        logger.exception("LLM call failed: %s", e)
+        logger.exception(f"Gemini call failed: {e}")
         return None
