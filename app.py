@@ -1,4 +1,3 @@
-# app.py
 import os
 import time
 import threading
@@ -10,7 +9,17 @@ from solver import solve_quiz_with_deadline
 load_dotenv()
 
 APP = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+
+# --- LOGGING CONFIGURATION ---
+# Set default logging to INFO
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Silence noisy libraries that flood the logs
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("pdfminer").setLevel(logging.WARNING)
+logging.getLogger("pdfplumber").setLevel(logging.WARNING)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+# -----------------------------
 
 QUIZ_SECRET = os.getenv("QUIZ_SECRET")
 if not QUIZ_SECRET:
