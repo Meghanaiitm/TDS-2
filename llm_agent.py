@@ -10,8 +10,8 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
     logger.warning("GEMINI_API_KEY not set")
 
-# WORKING FREE MODEL
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+# THE ONE AND ONLY WORKING ENDPOINT
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
 
 def ask_llm_for_action(page_text: str, pre_text: str = None):
     if not API_KEY:
@@ -47,3 +47,4 @@ def ask_llm_for_action(page_text: str, pre_text: str = None):
     except Exception as e:
         logger.exception(f"Gemini call failed: {e}")
         return None
+
