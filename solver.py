@@ -1,5 +1,4 @@
-# solver.py  (synchronous, no Playwright)
-
+# solver.py  (synchronous, Gemini-only)
 import time
 import logging
 import re
@@ -7,6 +6,8 @@ import json
 import base64
 import os
 from typing import Optional
+from io import BytesIO
+from urllib.parse import urljoin
 
 import requests
 import pandas as pd
@@ -23,24 +24,14 @@ from utils import (
 )
 from llm_agent import ask_llm_for_action
 
-# audio
-import openai
-
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-if OPENAI_KEY:
-    openai.api_key = OPENAI_KEY
-
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("solver")
+logging.basicConfig(level=logging.INFO)
 
 
 # ----------------- entrypoint -----------------
 
 def solve_quiz_with_deadline(url: str, email: str, secret: str,
                              start_time: float, max_seconds: int) -> None:
-    """
-    Top-level entry, called from app.py in a background thread.
-    """
     deadline = start_time + max_seconds
     remaining = deadline - time.time()
     if remaining <= 3:
@@ -70,7 +61,7 @@ def _solve_quiz_chain(initial_url: str, email: str, secret: str, deadline: float
 
         logger.info("Loading %s (time left %d)", current_url, time_left())
         try:
-            resp = requests.get(current_url, timeout=45)
+            resp = requests.get(current_url, timeout=40)
             resp.raise_for_status()
         except Exception as e:
             logger.error("Page load failed: %s", e)
@@ -79,18 +70,14 @@ def _solve_quiz_chain(initial_url: str, email: str, secret: str, deadline: float
         html = resp.text or ""
         soup = BeautifulSoup(html, "lxml")
 
-        # Visible text
+        # Visible text and candidate instruction blocks
         visible_text = soup.get_text(separator="\n")
-
-        # <pre> blocks (often contain JSON instructions)
         pre_blocks = [tag.get_text("\n") for tag in soup.find_all("pre")]
         pre_text = "\n\n".join(pre_blocks)
-
-        # <script> blocks (for e.g. atob(...) encoded text)
         script_texts = [tag.get_text() for tag in soup.find_all("script")]
         script_text = "\n\n".join(script_texts)
 
-        # Try to decode atob(`...`) style base64 strings if present
+        # decode atob(`...`) base64-in-script if present
         decoded_chunks = []
         for m in re.finditer(r"atob\(`([^`]+)`\)", script_text):
             b64 = m.group(1).replace("\n", "")
@@ -99,15 +86,12 @@ def _solve_quiz_chain(initial_url: str, email: str, secret: str, deadline: float
                 decoded_chunks.append(decoded)
             except Exception:
                 pass
-
         decoded_text = "\n\n".join(decoded_chunks)
         if decoded_text:
             pre_text = (pre_text + "\n\n" + decoded_text).strip()
 
         page_text = visible_text
-
-        logger.info("Page snippet: %s",
-                    (page_text[:300].replace("\n", " ") if page_text else "") )
+        logger.info("Page snippet: %s", (page_text[:300].replace("\n", " ") if page_text else ""))
 
         # 1) detect submit URL
         submit_url = detect_submit_url(page_text, pre_text, current_url)
@@ -116,7 +100,7 @@ def _solve_quiz_chain(initial_url: str, email: str, secret: str, deadline: float
             break
         logger.info("Submit URL: %s", submit_url)
 
-        # 2) detect data file
+        # 2) detect data file (csv/pdf/xlsx/json)
         file_url = detect_file_url(page_text, pre_text)
         file_bytes = None
         file_ext = None
@@ -137,23 +121,24 @@ def _solve_quiz_chain(initial_url: str, email: str, secret: str, deadline: float
             logger.info("Found scrape instruction -> visiting %s", scrape_url)
             secret_code = scrape_secondary_page(scrape_url)
 
-        # 4) detect audio URL
+        # 4) detect audio URL - (we are not transcribing audio; skip)
         audio_url = detect_audio_url(page_text, pre_text)
         audio_transcript = None
-        if audio_url:
-            logger.info("Detected audio URL: %s", audio_url)
-            audio_transcript = transcribe_audio(audio_url)
 
         # 5) decide action (heuristics + optional LLM)
         question_spec = parse_question_text(page_text, pre_text)
-        if question_spec.get("action") == "return_text" or question_spec.get("action") is None:
+        # if parse didn't fully decide, ask Gemini LLM for structured action
+        if question_spec.get("action") in (None, "return_text"):
             llm_spec = None
             try:
                 llm_spec = ask_llm_for_action(page_text, pre_text)
             except Exception:
                 llm_spec = None
             if llm_spec:
-                question_spec.update(llm_spec)
+                # safe merge: only allow known fields
+                for k in ("action", "column", "page", "cutoff"):
+                    if k in llm_spec:
+                        question_spec[k] = llm_spec[k]
 
         # 6) compute answer
         answer = None
@@ -182,7 +167,7 @@ def _solve_quiz_chain(initial_url: str, email: str, secret: str, deadline: float
                     answer = len([ln for ln in page_text.splitlines() if ln.strip()])
                 elif act == "chart":
                     try:
-                        dfs = pd.read_html(page_text)
+                        dfs = pd.read_html(html)
                         if dfs:
                             answer = df_to_chart_data_uri(dfs[0])
                         else:
@@ -195,7 +180,7 @@ def _solve_quiz_chain(initial_url: str, email: str, secret: str, deadline: float
             logger.exception("Error computing answer: %s", e)
             answer = page_text.strip()[:600] if page_text else ""
 
-        # 7) submit payload
+        # 7) submit payload (trim if huge)
         payload = {"email": email, "secret": secret, "url": current_url, "answer": answer}
         payload = enforce_payload_limit(payload)
 
@@ -226,7 +211,7 @@ def _solve_quiz_chain(initial_url: str, email: str, secret: str, deadline: float
     logger.info("Solver completed; time left: %d", time_left())
 
 
-# ----------------- helpers (adapted to requests/BeautifulSoup) -----------------
+# ----------------- helpers -----------------
 
 def detect_submit_url(page_text: str, pre_text: str, current_url: str) -> Optional[str]:
     content = (pre_text or "") + "\n" + (page_text or "")
@@ -239,11 +224,9 @@ def detect_submit_url(page_text: str, pre_text: str, current_url: str) -> Option
     # relative /submit
     m = re.search(r"(^|[^A-Za-z])(\/submit[^\s'\"<>]*)", content, flags=re.I)
     if m:
-        from urllib.parse import urljoin
         return urljoin(current_url, m.group(2))
     m = re.search(r"post\s+back\s+to\s+(\/submit[^\s'\"<>]*)", content, flags=re.I)
     if m:
-        from urllib.parse import urljoin
         return urljoin(current_url, m.group(1))
     return None
 
@@ -257,7 +240,6 @@ def detect_file_url(page_text: str, pre_text: str) -> Optional[str]:
 def detect_scrape_url(page_text: str, current_url: str) -> Optional[str]:
     m = re.search(r"scrape\s+([\/][^\s'\"<>]+)", page_text, flags=re.I)
     if m:
-        from urllib.parse import urljoin
         return urljoin(current_url, m.group(1))
     return None
 
@@ -283,40 +265,6 @@ def detect_audio_url(page_text: str, pre_text: str) -> Optional[str]:
     content = (pre_text or "") + "\n" + (page_text or "")
     m = re.search(r"https?://[^\s'\"<>]+\.(mp3|wav|m4a|ogg)", content, flags=re.I)
     return m.group(0) if m else None
-
-
-def transcribe_audio(audio_url: str) -> Optional[str]:
-    try:
-        r = requests.get(audio_url, timeout=30)
-        if not r.ok:
-            logger.error("Audio download failed: %s", r.status_code)
-            return None
-        audio_bytes = r.content
-    except Exception as e:
-        logger.error("Audio fetch error: %s", e)
-        return None
-
-    # Prefer OpenAI speech-to-text if API key present
-    if OPENAI_KEY:
-        try:
-            import tempfile
-            tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-            tf.write(audio_bytes)
-            tf.flush()
-            tf.close()
-            with open(tf.name, "rb") as f:
-                resp = openai.Audio.transcribe("gpt-4o-transcribe", f)
-                txt = None
-                if isinstance(resp, dict):
-                    txt = resp.get("text") or resp.get("transcription") or None
-                else:
-                    txt = getattr(resp, "text", None)
-                return txt
-        except Exception as e:
-            logger.exception("OpenAI audio transcribe failed: %s", e)
-
-    # Fallback: just say we couldn't transcribe
-    return None
 
 
 def enforce_payload_limit(payload: dict) -> dict:
