@@ -1,181 +1,253 @@
 # utils.py
 import re
-import io
-import base64
 import json
+from io import BytesIO
+import base64
 import logging
-import matplotlib.pyplot as plt
+
 import pandas as pd
-from typing import Any, Optional
+import matplotlib.pyplot as plt
+import pdfplumber
 
 logger = logging.getLogger("utils")
+logging.basicConfig(level=logging.INFO)
 
-def text_lower(s):
-    return s.lower() if s else s
 
-def parse_question_text(page_text: str, pre_text: Optional[str] = None) -> dict:
-    text = (pre_text or "") + "\n" + (page_text or "")
-    txt = text.lower()
-    # detect cutoff patterns (e.g., "Cutoff: 38636")
-    m_cut = re.search(r"cutoff[:\s]+([0-9]+)", txt)
-    cutoff = int(m_cut.group(1)) if m_cut else None
+# ---------------- parse simple questions heuristics ----------------
 
-    # sum of column
-    if "sum of the" in txt and "column" in txt:
-        m = re.search(r"sum of the\s+['\"]?([a-z0-9 _-]+)['\"]?\s+column", txt)
-        col = m.group(1) if m else None
-        return {"action": "sum", "column": col, "cutoff": cutoff}
+def parse_question_text(page_text: str, pre_text: str = None) -> dict:
+    """
+    Heuristic parsing for common instructions.
+    Returns dict with keys: action, column, cutoff, page
+    """
+    content = (pre_text or "") + "\n" + (page_text or "")
+    out = {"action": None, "column": None, "cutoff": None, "page": None}
 
-    # count rows
-    if "count" in txt and "rows" in txt:
-        return {"action": "count", "cutoff": cutoff}
+    txt = content.lower()
 
-    # max/min
-    if ("max" in txt or "maximum" in txt) and "column" in txt:
-        m = re.search(r"(?:max(?:imum)? of the|maximum of the)\s+['\"]?([a-z0-9 _-]+)['\"]?\s+column", txt)
-        col = m.group(1) if m else None
-        return {"action": "max", "column": col, "cutoff": cutoff}
+    # common: "count the rows" / "how many rows"
+    if re.search(r"\b(count|how many)\b.*\b(rows|entries|lines)\b", txt):
+        out["action"] = "count"
+        return out
 
-    if "mean" in txt or "average" in txt:
-        m = re.search(r"(?:mean|average) of the\s+['\"]?([a-z0-9 _-]+)['\"]?\s+column", txt)
-        col = m.group(1) if m else None
-        return {"action": "mean", "column": col, "cutoff": cutoff}
+    # sum / mean / max / min
+    m = re.search(r"(sum|total|mean|average|max|min|median)\s+of\s+([A-Za-z0-9_ \-]+)", txt)
+    if m:
+        verb = m.group(1)
+        col = m.group(2).strip().replace(" ", "_")
+        if "sum" in verb or "total" in verb:
+            out["action"] = "sum"
+        elif "mean" in verb or "average" in verb:
+            out["action"] = "mean"
+        elif "max" in verb:
+            out["action"] = "max"
+        elif "min" in verb:
+            out["action"] = "min"
+        elif "median" in verb:
+            out["action"] = "median"
+        out["column"] = col
+        return out
 
-    # pdf page mention
-    if "page" in txt and "pdf" in txt:
-        m = re.search(r"page\s+([0-9]+)", txt)
-        page = int(m.group(1)) if m else None
-        return {"action": "pdf_read", "page": page}
+    # filter like 'greater than 100' or '> 100' for cutoff
+    m2 = re.search(r"(?:greater than|>|\bmore than\b)\s*([0-9,\.]+)", txt)
+    if m2:
+        out["cutoff"] = float(m2.group(1).replace(",", ""))
 
-    if "chart" in txt or "plot" in txt:
-        return {"action": "chart", "chart": True}
+    # chart
+    if re.search(r"\b(chart|plot|graph)\b", txt):
+        out["action"] = "chart"
+        return out
 
-    if "download" in txt or "file" in txt or "csv" in txt:
-        return {"action": "download_return_file", "cutoff": cutoff}
+    # pdf page
+    m3 = re.search(r"page\s+(\d+)", txt)
+    if m3:
+        out["page"] = int(m3.group(1))
 
-    return {"action": "return_text"}
+    # fallback: return_text
+    out["action"] = out["action"] or "return_text"
+    return out
 
-def compute_answer_from_csv_bytes(bytes_data: bytes, action: dict) -> Any:
+
+# ---------------- CSV / Excel / PDF computation helpers ----------------
+
+def compute_answer_from_csv_bytes(b: bytes, spec: dict):
+    buf = BytesIO(b)
     try:
-        df = pd.read_csv(io.BytesIO(bytes_data))
+        df = pd.read_csv(buf)
     except Exception:
-        df = pd.read_csv(io.BytesIO(bytes_data), sep=None, engine="python")
+        # try excel-ish reading
+        buf.seek(0)
+        df = pd.read_csv(buf, engine="python", error_bad_lines=False)
+    return _compute_from_dataframe(df, spec)
 
-    return compute_answer_from_df(df, action)
 
-def compute_answer_from_excel_bytes(bytes_data: bytes, action: dict) -> Any:
-    df = pd.read_excel(io.BytesIO(bytes_data))
-    return compute_answer_from_df(df, action)
-
-def compute_answer_from_df(df: pd.DataFrame, action: dict) -> Any:
-    act = action.get("action")
-    col = action.get("column")
-    cutoff = action.get("cutoff")
-
-    # try to normalize column names
-    cols = [c.lower() for c in df.columns]
-    # mapping: if requested col exists case-insensitive, use it
-    if col:
-        matches = [c for c in df.columns if c.lower() == col.lower()]
-        if matches:
-            colname = matches[0]
-        else:
-            # fuzzy match for common names
-            candidates = ["value", "amount", "price", "score", "count"]
-            found = None
-            for cand in candidates:
-                if cand in cols:
-                    found = df.columns[cols.index(cand)]
-                    break
-            colname = found
-    else:
-        # pick a default numeric column if possible
-        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-        colname = num_cols[0] if num_cols else None
-
-    if act == "count":
-        if cutoff is not None and colname:
-            return int((pd.to_numeric(df[colname], errors="coerce") > cutoff).sum())
-        return int(len(df))
-
-    if colname:
-        series = pd.to_numeric(df[colname], errors="coerce").dropna()
-        if cutoff is not None:
-            series = series[series > cutoff]
-        if act == "sum":
-            return float(series.sum())
-        if act in ("mean", "average"):
-            return float(series.mean())
-        if act == "max":
-            return float(series.max())
-        if act == "min":
-            return float(series.min())
-
-    # fallback: try sum of common column 'value'
-    for candidate in ["value", "amount", "price", "score"]:
-        if candidate in cols:
-            s = pd.to_numeric(df[candidate], errors="coerce").dropna()
-            if cutoff is not None:
-                s = s[s > cutoff]
-            if act == "sum":
-                return float(s.sum())
-    # ultimate fallback: row count
-    return int(len(df))
-
-def compute_answer_from_pdf_bytes(bytes_data: bytes, action: dict) -> Any:
-    import pdfplumber
+def compute_answer_from_excel_bytes(b: bytes, spec: dict):
+    buf = BytesIO(b)
     try:
-        with pdfplumber.open(io.BytesIO(bytes_data)) as pdf:
-            page_num = action.get("page")
-            if page_num:
-                idx = max(0, page_num - 1)
-                if idx < len(pdf.pages):
-                    page = pdf.pages[idx]
-                    text = page.extract_text() or ""
-                    tables = page.extract_tables()
-                    if tables:
-                        rows = tables[0]
-                        if len(rows) >= 2:
-                            df = pd.DataFrame(rows[1:], columns=rows[0])
-                            return compute_answer_from_df(df, action)
-                    if action.get("action") == "sum":
-                        nums = [float(x) for x in re.findall(r"[-+]?\d*\.\d+|\d+", text)]
-                        return float(sum(nums))
-                    return text.strip()
+        df = pd.read_excel(buf)
+    except Exception:
+        # try reading all sheets and pick first
+        buf.seek(0)
+        xls = pd.ExcelFile(buf)
+        df = xls.parse(xls.sheet_names[0])
+    return _compute_from_dataframe(df, spec)
+
+
+def compute_answer_from_pdf_bytes(b: bytes, spec: dict):
+    """
+    Extract text from PDF. If the spec asks for numeric aggregation and a table is present,
+    we attempt to parse tables with pandas read_html (rare) or simple regex numbers.
+    Otherwise return extracted text.
+    """
+    try:
+        with pdfplumber.open(BytesIO(b)) as pdf:
+            page_no = spec.get("page", 1)
+            page_no = max(1, page_no)
+            if page_no <= len(pdf.pages):
+                page = pdf.pages[page_no - 1]
+                text = page.extract_text() or ""
             else:
-                all_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
-                if action.get("action") in ("sum",):
-                    nums = [float(x) for x in re.findall(r"[-+]?\d*\.\d+|\d+", all_text)]
-                    return float(sum(nums))
-                return all_text.strip()
-    except Exception as e:
-        logger.exception("PDF parse error: %s", e)
-        return None
+                text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+    except Exception:
+        text = b.decode("utf-8", errors="ignore")[:2000]
 
-def file_bytes_to_data_uri(bytes_data: bytes, ext: str) -> str:
-    mime = "application/octet-stream"
-    if ext in ("png","jpg","jpeg"):
-        mime = f"image/{ext}"
-    elif ext == "pdf":
-        mime = "application/pdf"
-    elif ext == "csv":
-        mime = "text/csv"
-    b64 = base64.b64encode(bytes_data).decode("ascii")
-    return f"data:{mime};base64,{b64}"
+    # if spec wants sum/mean/... try simple numeric extraction on page text
+    action = spec.get("action")
+    if action in ("sum", "mean", "max", "min", "count", "median"):
+        nums = [float(x.replace(",", "")) for x in re.findall(r"[-+]?\d{1,3}(?:[,]\d{3})*(?:\.\d+)?|\d+\.\d+", text)]
+        if not nums:
+            return text.strip()[:1000]
+        if action == "sum":
+            return sum(nums)
+        if action == "mean":
+            return sum(nums) / len(nums)
+        if action == "max":
+            return max(nums)
+        if action == "min":
+            return min(nums)
+        if action == "count":
+            return len(nums)
+        if action == "median":
+            nums.sort()
+            n = len(nums)
+            mid = n // 2
+            return (nums[mid] if n % 2 else (nums[mid - 1] + nums[mid]) / 2)
+    return text.strip()[:2000]
 
-def df_to_chart_data_uri(df, x=None, y=None, kind="bar") -> str:
-    buf = io.BytesIO()
-    plt.figure(figsize=(6,4))
-    if x and y and x in df.columns and y in df.columns:
-        df.plot(kind=kind, x=x, y=y)
+
+def _compute_from_dataframe(df: pd.DataFrame, spec: dict):
+    """
+    Unified operations for DataFrame:
+    - actions: sum/mean/max/min/count/chart/return_text
+    - columns: accept common variants (case-insensitive)
+    """
+    if df is None or df.empty:
+        return "empty"
+
+    action = spec.get("action")
+    col = spec.get("column")
+    cutoff = spec.get("cutoff")
+
+    # Normalize and allow some fuzzy column matches for booknow/cinepos
+    colname = None
+    if col:
+        # try direct match first
+        if col in df.columns:
+            colname = col
+        else:
+            # case-insensitive match
+            for c in df.columns:
+                if c.lower() == col.lower() or c.lower().replace(" ", "_") == col.lower().replace(" ", "_"):
+                    colname = c
+                    break
     else:
-        df.plot(kind=kind)
-    plt.tight_layout()
-    plt.savefig(buf, format="png")
-    plt.close()
-    buf.seek(0)
-    b64 = base64.b64encode(buf.read()).decode("ascii")
-    return f"data:image/png;base64,{b64}"
+        # if only one numeric column, pick it for simple ops
+        numeric_cols = df.select_dtypes(include="number").columns.tolist()
+        if len(numeric_cols) == 1:
+            colname = numeric_cols[0]
+
+    # handle known dataset column patterns (BOOKNOW and CINEPOS)
+    # Use user-specified names (from problem): 
+    # BOOKNOW: ['book_theater_id','show_datetime','booking_datetime','tickets_booked']
+    # CINEPOS: ['cine_theater_id','show_datetime','booking_datetime','tickets_sold']
+    # Accept both 'tickets_booked' and 'tickets_sold' as numeric column candidates
+    for candidate in ("tickets_booked", "tickets_sold", "tickets"):
+        if candidate in df.columns and not colname:
+            colname = candidate
+            break
+
+    try:
+        if action in ("sum", "mean", "max", "min", "count", "median"):
+            if not colname:
+                return "no-column"
+            series = pd.to_numeric(df[colname], errors="coerce").dropna()
+            if cutoff is not None:
+                series = series[series > float(cutoff)]
+            if series.empty:
+                return 0 if action == "sum" else None
+            if action == "sum":
+                return float(series.sum())
+            if action == "mean":
+                return float(series.mean())
+            if action == "max":
+                return float(series.max())
+            if action == "min":
+                return float(series.min())
+            if action == "count":
+                return int(series.count())
+            if action == "median":
+                return float(series.median())
+        elif action == "chart":
+            # produce chart data URI of first two columns if numeric available
+            return df_to_chart_data_uri(df)
+        else:
+            # default: return a short JSON/text summary
+            return df.head(10).to_json(orient="records")
+    except Exception as e:
+        logger.exception("Dataframe compute failed: %s", e)
+        return df.head(5).to_json(orient="records")
+
+
+# ---------------- helpers: file -> data URI and small utils ----------------
+
+def file_bytes_to_data_uri(b: bytes, ext: str) -> str:
+    b64 = base64.b64encode(b).decode("ascii")
+    return f"data:application/{ext};base64,{b64}"
+
+
+def df_to_chart_data_uri(df):
+    # Simple chart: first numeric column vs index
+    try:
+        s = None
+        numcols = df.select_dtypes(include="number").columns.tolist()
+        if numcols:
+            s = df[numcols[0]].dropna()
+            plt.figure(figsize=(6, 3))
+            plt.plot(s.index.values, s.values)
+            plt.title(str(numcols[0]))
+            plt.tight_layout()
+            buf = BytesIO()
+            plt.savefig(buf, format="png", bbox_inches="tight")
+            buf.seek(0)
+            data = base64.b64encode(buf.read()).decode("ascii")
+            plt.close()
+            return f"data:image/png;base64,{data}"
+        else:
+            # fallback: table snapshot as text image
+            txt = df.head(10).to_string()
+            plt.figure(figsize=(6, 3))
+            plt.text(0, 1, txt, fontsize=8, va="top")
+            plt.axis("off")
+            buf = BytesIO()
+            plt.savefig(buf, format="png", bbox_inches="tight")
+            buf.seek(0)
+            data = base64.b64encode(buf.read()).decode("ascii")
+            plt.close()
+            return f"data:image/png;base64,{data}"
+    except Exception as e:
+        logger.exception("Chart creation failed: %s", e)
+        return "chart-failed"
+
 
 def safe_json_parse(s: str):
     try:
