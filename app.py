@@ -1,60 +1,52 @@
-# app.py
+import os
 import time
 import threading
 import logging
 from flask import Flask, request, jsonify
-
-# Import validated configuration
-from config import SECRET as QUIZ_SECRET, PORT
+from dotenv import load_dotenv
 from solver import solve_quiz_with_deadline
 
+load_dotenv()
 APP = Flask(__name__)
 
-# -------------------------
-# LOGGING CONFIGURATION
-# -------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 
-# Silence noisy libraries
-for lib in ["urllib3", "pdfminer", "pdfplumber", "matplotlib"]:
-    logging.getLogger(lib).setLevel(logging.WARNING)
-
-
-MAX_TOTAL_SECONDS = 170   # Hard limit: 2 minutes 50 seconds
-
-
-# -------------------------
-# ROUTES
-# -------------------------
+QUIZ_SECRET = os.getenv("QUIZ_SECRET")
+MAX_TOTAL_SECONDS = 170
 
 @APP.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
-
 
 @APP.route("/api/quiz", methods=["POST"])
 def api_quiz():
     if not request.is_json:
         return jsonify({"error": "Invalid JSON"}), 400
 
-    data = request.get_json(silent=True)
-    if data is None:
-        return jsonify({"error": "Invalid JSON"}), 400
-
+    data = request.get_json()
     email = data.get("email")
     secret = data.get("secret")
     url = data.get("url")
 
     if not email or not secret or not url:
-        return jsonify({"error": "Missing fields: email, secret, url required"}), 400
+        return jsonify({"error": "email, secret, url required"}), 400
 
-    # Validate the secret
     if secret != QUIZ_SECRET:
         return jsonify({"error": "Invalid secret"}), 403
 
-    # Accept request immediately
-    response = jsonify({"status": "accepted"})
-    response.status_code = 200
+    resp = jsonify({"status": "accepted"})
+
+    start = time.time()
+    t = threading.Thread(
+        target=solve_quiz_with_deadline,
+        args=(url, email, secret, start, MAX_TOTAL_SECONDS),
+        daemon=True,
+    )
+    t.start()
+
+    return resp
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 3000))
+    APP.run(host="0.0.0.0", port=port)
+
