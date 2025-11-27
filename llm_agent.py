@@ -7,59 +7,83 @@ from google.api_core.exceptions import NotFound
 
 logger = logging.getLogger("llm_agent")
 
-# 1. Get Key and Clean it (fixes copy-paste whitespace issues)
+# Load and clean API key
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# 2. Configure SDK
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+else:
+    logger.error("⚠️ GEMINI_API_KEY is missing! Quiz solving will fail.")
 
+# ------------------------------
+# MAIN FUNCTION
+# ------------------------------
 def ask_llm_for_action(page_text: str, pre_text: str = None) -> dict | None:
     """
-    Uses Gemini 1.5 Flash to determine the next action.
-    Returns a Python dictionary (parsed from JSON).
+    Sends instruction + page text to Gemini and expects EXACT JSON output.
     """
     if not GEMINI_API_KEY:
-        logger.error("GEMINI_API_KEY is missing/empty.")
+        logger.error("GEMINI_API_KEY missing.")
         return None
 
     try:
-        # Use JSON mode for reliable output
-        generation_config = {
-            "temperature": 0.0,
-            "response_mime_type": "application/json"
-        }
-
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            generation_config=generation_config
+            "gemini-1.5-flash",
+            generation_config={
+                "temperature": 0.0,
+                "response_mime_type": "application/json"
+            }
         )
 
         prompt = f"""
-        You are an autonomous agent solving a data quiz.
-        Analyze the instruction and page text to decide the next action.
-        
-        Return ONLY a JSON object with these keys:
-        - "action": One of ["return_text", "sum", "mean", "max", "min", "count", "chart", "download_return_file", "pdf_read"]
-        - "column": (string) The specific column name to operate on, if applicable.
-        - "cutoff": (number) Filter value, if instruction says "greater than X".
-        - "page": (number) Page number if reading a PDF.
+You are an autonomous agent solving an instruction-based data quiz.
+Your job is to output a JSON object describing the next computational action.
 
-        INSTRUCTION:
-        {pre_text or "No specific instruction."}
+VALID ACTIONS:
+- "return_text"
+- "sum"
+- "mean"
+- "max"
+- "min"
+- "count"
+- "chart"
+- "download_return_file"
+- "pdf_read"
 
-        PAGE CONTENT:
-        {page_text[:5000]} 
-        """
-        # Note: Truncated page_text to 5000 chars to save tokens/speed
+VALID OPTIONAL FIELDS:
+- "column": column name to operate on
+- "cutoff": numeric cutoff (e.g. > 50)
+- "page": page number for PDFs
 
-        response = model.generate_content(prompt)
-        
-        # Parse the response
-        result = json.loads(response.text)
-        logger.info(f"LLM Decision: {result}")
+Return ONLY JSON. No explanation.
+
+INSTRUCTION:
+{pre_text or "None"}
+
+PAGE TEXT:
+{page_text[:8000]}
+"""
+
+        # Must wrap prompt in a list
+        response = model.generate_content([prompt])
+
+        # Extract clean JSON text
+        raw = response.candidates[0].content.parts[0].text.strip()
+
+        # Parse JSON
+        result = json.loads(raw)
+
+        logger.info(f"LLM decision → {result}")
         return result
 
+    except NotFound:
+        logger.error("❌ Gemini model not found. Check model name 'gemini-1.5-flash'.")
+        return None
+
+    except json.JSONDecodeError:
+        logger.error(f"❌ LLM returned non-JSON: {raw}")
+        return None
+
     except Exception as e:
-        logger.error(f"Gemini LLM call failed: {e}")
+        logger.error(f"Gemini call failed: {e}")
         return None
